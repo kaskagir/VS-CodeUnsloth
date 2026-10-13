@@ -1,7 +1,178 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
+exports.deactivate = deactivate;
 const vscode = require("vscode");
+const child_process_1 = require("child_process");
+class McpServer {
+    name;
+    cfg;
+    tools = [];
+    proc;
+    buf = '';
+    nextId = 1;
+    pending = new Map();
+    stderr = '';
+    constructor(name, cfg) {
+        this.name = name;
+        this.cfg = cfg;
+    }
+    async start() {
+        const win = process.platform === 'win32';
+        const sq = (a) => `'${a.replace(/'/g, `'\\''`)}'`;
+        if (this.cfg.wsl && win) {
+            const exports = Object.entries(this.cfg.env ?? {}).map(([k, v]) => `export ${k}=${sq(v)};`).join(' ');
+            const cd = this.cfg.cwd ? `cd ${sq(this.cfg.cwd)} && ` : '';
+            const line = `${exports} ${cd}exec ${[this.cfg.command, ...(this.cfg.args ?? [])].map(sq).join(' ')}`;
+            const distro = typeof this.cfg.wsl === 'string' && this.cfg.wsl ? ['-d', this.cfg.wsl] : [];
+            this.proc = (0, child_process_1.spawn)('wsl.exe', [...distro, '--', 'bash', '-lc', line], { windowsHide: true });
+        }
+        else {
+            const q = (a) => (win && /[\s"&|<>^%]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a);
+            this.proc = (0, child_process_1.spawn)(q(this.cfg.command), (this.cfg.args ?? []).map(q), {
+                env: { ...process.env, ...(this.cfg.env ?? {}) },
+                cwd: this.cfg.cwd || undefined,
+                shell: win,
+                windowsHide: true
+            });
+        }
+        const fail = (err) => {
+            for (const [id, p] of this.pending) {
+                clearTimeout(p.timer);
+                p.reject(err);
+                this.pending.delete(id);
+            }
+        };
+        this.proc.on('error', fail);
+        this.proc.on('exit', code => fail(new Error(`MCP server exited (code ${code}). ${this.stderr.slice(-300)}`)));
+        this.proc.stderr?.on('data', d => { this.stderr = (this.stderr + String(d)).slice(-2000); });
+        this.proc.stdout?.on('data', d => {
+            this.buf += String(d);
+            const lines = this.buf.split('\n');
+            this.buf = lines.pop() ?? '';
+            for (const l of lines) {
+                try {
+                    const m = JSON.parse(l);
+                    const p = typeof m.id === 'number' ? this.pending.get(m.id) : undefined;
+                    if (p) {
+                        clearTimeout(p.timer);
+                        this.pending.delete(m.id);
+                        if (m.error) {
+                            p.reject(new Error(m.error.message ?? JSON.stringify(m.error)));
+                        }
+                        else {
+                            p.resolve(m.result);
+                        }
+                    }
+                }
+                catch {
+                    // keine JSON-Zeile (z. B. Log-Ausgabe), ignorieren
+                }
+            }
+        });
+        await this.request('initialize', {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            clientInfo: { name: 'unsloth-chat', version: '1.0' }
+        }, 90000);
+        this.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+        const res = await this.request('tools/list', {}, 30000);
+        this.tools = res?.tools ?? [];
+    }
+    send(msg) {
+        this.proc?.stdin?.write(JSON.stringify(msg) + '\n');
+    }
+    request(method, params, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            const id = this.nextId++;
+            const timer = setTimeout(() => {
+                this.pending.delete(id);
+                reject(new Error(`MCP timeout: ${method}`));
+            }, timeoutMs);
+            this.pending.set(id, { resolve, reject, timer });
+            this.send({ jsonrpc: '2.0', id, method, params });
+        });
+    }
+    async call(tool, args) {
+        const res = await this.request('tools/call', { name: tool, arguments: args }, 300000);
+        const parts = (res?.content ?? []).map((c) => (c.type === 'text' ? c.text : `[${c.type}]`));
+        const text = parts.join('\n') || JSON.stringify(res ?? '');
+        return res?.isError ? `Error: ${text}` : text;
+    }
+    stop() {
+        const pid = this.proc?.pid;
+        if (!pid) {
+            return;
+        }
+        if (process.platform === 'win32') {
+            (0, child_process_1.spawn)('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+        }
+        else {
+            this.proc?.kill();
+        }
+    }
+}
+class McpManager {
+    servers = new Map();
+    failed = new Map();
+    key = '';
+    lock = Promise.resolve();
+    sync(raw) {
+        const run = this.lock.then(() => this.doSync(raw));
+        this.lock = run.catch(() => undefined);
+        return run;
+    }
+    async doSync(raw) {
+        const key = JSON.stringify(raw ?? {});
+        if (key !== this.key) {
+            this.reset();
+            this.key = key;
+        }
+        const errors = [];
+        await Promise.all(Object.entries(raw ?? {}).map(async ([name, cfg]) => {
+            if (this.servers.has(name) || !cfg?.command) {
+                return;
+            }
+            if (this.failed.has(name)) {
+                errors.push(`${name}: ${this.failed.get(name)}`);
+                return;
+            }
+            const srv = new McpServer(name, cfg);
+            try {
+                await srv.start();
+                this.servers.set(name, srv);
+            }
+            catch (e) {
+                srv.stop();
+                this.failed.set(name, String(e?.message ?? e));
+                errors.push(`${name}: ${this.failed.get(name)}`);
+            }
+        }));
+        const defs = [];
+        const routes = new Map();
+        for (const [name, srv] of this.servers) {
+            for (const t of srv.tools) {
+                const fn = `${name}__${t.name}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+                routes.set(fn, { server: srv, tool: t.name, label: `${name}/${t.name}` });
+                defs.push({
+                    type: 'function',
+                    function: {
+                        name: fn,
+                        description: String(t.description ?? '').slice(0, 1000),
+                        parameters: t.inputSchema ?? { type: 'object', properties: {} }
+                    }
+                });
+            }
+        }
+        return { defs, routes, errors };
+    }
+    reset() {
+        this.servers.forEach(s => s.stop());
+        this.servers.clear();
+        this.failed.clear();
+    }
+}
+const mcpManager = new McpManager();
 const FIELDS = {
     baseUrl: 's', apiKey: 's', model: 's', systemPrompt: 's', reasoningEffort: 's', runFlags: 's',
     temperature: 'n', maxTokens: 'n', topP: 'n', topK: 'n', minP: 'n', repeatPenalty: 'n', seed: 'n',
@@ -34,6 +205,8 @@ const I18N = {
     loadModels: ["Modelle laden", "Load models"],
     runModelTip: ["Startet 'unsloth run --model ...' in einem Terminal", "Starts 'unsloth run --model ...' in a terminal"],
     runModel: ["Modell per CLI starten", "Start model via CLI"],
+    openSettingsJson: ["MCP-Server in settings.json eintragen", "Edit MCP servers in settings.json"],
+    openSettingsJsonTip: ["Öffnet die settings.json (Einstellung unslothChat.mcpServers)", "Opens settings.json (setting unslothChat.mcpServers)"],
     runFlags: ["Zusätzliche Flags für \"unsloth run\"", "Additional flags for \"unsloth run\""],
     systemPrompt: ["System-Prompt", "System prompt"],
     reasoning: ["Reasoning-Aufwand", "Reasoning effort"],
@@ -68,6 +241,14 @@ const I18N = {
     pOffD: ["Führt Tools ohne Nachfrage aus; Sandbox bleibt aktiv.", "Runs tools without asking; sandbox stays on."],
     pFullD: ["Führt jeden Befehl ohne Nachfrage und ohne Sandbox aus. Gefährlich!", "Runs every command without asking and without sandbox. Dangerous!"],
     noModels: ["(keine Modelle gefunden)", "(no models found)"],
+    askMcp: ["Unsloth will das MCP-Tool \"{0}\" ausführen:\n{1}", "Unsloth wants to run the MCP tool \"{0}\":\n{1}"],
+    mcpFailed: ["MCP-Server nicht verfügbar – {0}", "MCP server unavailable – {0}"],
+    mcpCancelled: ["Vom Benutzer abgebrochen.", "Cancelled by user."],
+    mcpDenied: ["Vom Benutzer abgelehnt.", "Denied by user."],
+    mcpLimit: ["Maximale Anzahl Tool-Runden erreicht.", "Maximum number of tool rounds reached."],
+    mcpRestarted: ["MCP-Server werden beim nächsten Senden neu gestartet.", "MCP servers will be restarted on next send."],
+    mcpHint: ["Du hast Zugriff auf Tools des Benutzerrechners (MCP-Server: {0}). Nutze sie für alle Datei- und Befehlsaufgaben und verwende Pfade genau so, wie der Benutzer sie nennt. {1}", "You have access to tools on the user's own machine (MCP servers: {0}). Use them for all file and command tasks and use paths exactly as the user gives them. {1}"],
+    mcpHintExcl: ["Es gibt keine Sandbox; versuche nicht, Python- oder Terminal-Tools der Sandbox zu verwenden.", "There is no sandbox; do not try sandbox Python or terminal tools."],
     waiting: ["Warte auf Antwort von Unsloth …", "Waiting for response from Unsloth …"],
 };
 const LANG = vscode.env.language.toLowerCase().startsWith('de') ? 0 : 1;
@@ -93,11 +274,34 @@ class ChatEngine {
         this.id = id;
         this.sink = sink;
     }
+    confirms = new Map();
+    confirmSeq = 0;
+    cancelConfirms() {
+        this.confirms.forEach(r => r(false));
+        this.confirms.clear();
+    }
+    askInChat(text, signal) {
+        return new Promise(resolve => {
+            const id = `cf${++this.confirmSeq}`;
+            this.confirms.set(id, resolve);
+            signal.addEventListener('abort', () => {
+                this.confirms.delete(id);
+                resolve(false);
+            }, { once: true });
+            this.post({ type: 'confirm', id, text });
+        });
+    }
     dispose() {
         this.abort?.abort();
+        this.cancelConfirms();
     }
     async handle(msg) {
-        if (msg.type === 'send') {
+        if (msg.type === 'confirmResult') {
+            const r = this.confirms.get(String(msg.id));
+            this.confirms.delete(String(msg.id));
+            r?.(Boolean(msg.allow));
+        }
+        else if (msg.type === 'send') {
             await this.send(String(msg.text ?? ''), Boolean(msg.attachActive));
         }
         else if (msg.type === 'mentionQuery') {
@@ -108,6 +312,7 @@ class ChatEngine {
         }
         else if (msg.type === 'stop') {
             this.abort?.abort();
+            this.cancelConfirms();
         }
         else if (msg.type === 'clear') {
             this.clear();
@@ -129,6 +334,9 @@ class ChatEngine {
             await vscode.workspace.getConfiguration('unslothChat')
                 .update('model', String(msg.model ?? ''), vscode.ConfigurationTarget.Global);
             this.post({ type: 'info', text: t('modelSet', msg.model) });
+        }
+        else if (msg.type === 'openSettingsJson') {
+            await vscode.commands.executeCommand('workbench.action.openSettingsJson');
         }
         else if (msg.type === 'runModel') {
             this.runModel(String(msg.model ?? ''));
@@ -337,6 +545,7 @@ class ChatEngine {
     }
     clear() {
         this.abort?.abort();
+        this.cancelConfirms();
         this.history = [];
         this.sessionId = `vscode-${Date.now()}`;
         this.post({ type: 'cleared' });
@@ -458,55 +667,121 @@ class ChatEngine {
             messages[messages.length - 1] = { ...last, content: `${contextBlocks.join('\n\n')}\n\n${last.content}` };
         }
         this.abort = new AbortController();
-        this.post({ type: 'start' });
-        let answer = '';
+        const signal = this.abort.signal;
+        let partial = '';
         try {
-            const res = await fetch(`${baseUrl}/chat/completions`, {
-                method: 'POST',
-                headers,
-                signal: this.abort.signal,
-                body: JSON.stringify(this.buildBody(cfg, messages))
-            });
-            if (!res.ok || !res.body) {
-                throw new Error(`HTTP ${res.status} ${res.statusText}: ${await res.text()}`);
+            const mcp = await mcpManager.sync(cfg.get('mcpServers', {}) ?? {});
+            for (const err of mcp.errors) {
+                this.post({ type: 'error', text: t('mcpFailed', err) });
             }
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    break;
+            const exclusive = mcp.defs.length > 0 && cfg.get('mcpExclusive', true);
+            if (mcp.defs.length) {
+                const hint = t('mcpHint', [...new Set([...mcp.routes.values()].map(r => r.server.name))].join(', '), exclusive ? t('mcpHintExcl') : '');
+                if (messages[0]?.role === 'system') {
+                    messages[0] = { ...messages[0], content: `${messages[0].content}\n\n${hint}` };
                 }
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop() ?? '';
-                for (const raw of lines) {
-                    const line = raw.trim();
-                    if (!line.startsWith('data:')) {
-                        continue;
+                else {
+                    messages.unshift({ role: 'system', content: hint });
+                }
+            }
+            if (exclusive) {
+                delete headers['X-Unsloth-Events'];
+            }
+            for (let round = 0; round < 15; round++) {
+                this.post({ type: 'start' });
+                const body = this.buildBody(cfg, messages);
+                if (exclusive) {
+                    delete body.enable_tools;
+                    delete body.enabled_tools;
+                    delete body.session_id;
+                    delete body.permission_mode;
+                }
+                if (mcp.defs.length) {
+                    body.tools = mcp.defs;
+                }
+                const res = await fetch(`${baseUrl}/chat/completions`, {
+                    method: 'POST',
+                    headers,
+                    signal,
+                    body: JSON.stringify(body)
+                });
+                if (!res.ok || !res.body) {
+                    throw new Error(`HTTP ${res.status} ${res.statusText}: ${await res.text()}`);
+                }
+                const calls = new Map();
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
                     }
-                    const data = line.slice(5).trim();
-                    if (data === '[DONE]') {
-                        continue;
-                    }
-                    try {
-                        const json = JSON.parse(data);
-                        if (json && typeof json.type === 'string' && !json.choices) {
-                            await this.handleToolEvent(json);
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() ?? '';
+                    for (const raw of lines) {
+                        const line = raw.trim();
+                        if (!line.startsWith('data:')) {
                             continue;
                         }
-                        const delta = json.choices?.[0]?.delta?.content;
-                        if (delta) {
-                            answer += delta;
-                            this.post({ type: 'delta', text: delta });
+                        const data = line.slice(5).trim();
+                        if (data === '[DONE]') {
+                            continue;
+                        }
+                        try {
+                            const json = JSON.parse(data);
+                            if (json && typeof json.type === 'string' && !json.choices) {
+                                await this.handleToolEvent(json);
+                                continue;
+                            }
+                            const d = json.choices?.[0]?.delta;
+                            if (d?.content) {
+                                partial += d.content;
+                                this.post({ type: 'delta', text: d.content });
+                            }
+                            for (const tc of d?.tool_calls ?? []) {
+                                const idx = tc.index ?? 0;
+                                const c = calls.get(idx) ?? { id: '', type: 'function', function: { name: '', arguments: '' } };
+                                if (tc.id) {
+                                    c.id = tc.id;
+                                }
+                                if (tc.function?.name) {
+                                    c.function.name += tc.function.name;
+                                }
+                                if (tc.function?.arguments) {
+                                    c.function.arguments += tc.function.arguments;
+                                }
+                                calls.set(idx, c);
+                            }
+                        }
+                        catch {
+                            // unvollständiger Chunk ignorieren
                         }
                     }
-                    catch {
-                        // unvollständiger Chunk ignorieren
+                }
+                const toolCalls = [...calls.entries()].sort((x, y) => x[0] - y[0]).map(([i, c]) => ({
+                    ...c, id: c.id || `call_${i}_${Date.now()}`
+                }));
+                if (!toolCalls.length) {
+                    if (partial) {
+                        this.history.push({ role: 'assistant', content: partial });
+                        partial = '';
                     }
+                    return;
+                }
+                const assistantMsg = { role: 'assistant', content: partial || null, tool_calls: toolCalls };
+                partial = '';
+                this.history.push(assistantMsg);
+                messages.push(assistantMsg);
+                for (const tc of toolCalls) {
+                    const result = await this.runMcpTool(tc, mcp.routes, cfg, signal);
+                    const toolMsg = { role: 'tool', tool_call_id: tc.id, content: result };
+                    this.history.push(toolMsg);
+                    messages.push(toolMsg);
                 }
             }
+            this.post({ type: 'error', text: t('mcpLimit') });
         }
         catch (e) {
             if (e?.name !== 'AbortError') {
@@ -514,10 +789,45 @@ class ChatEngine {
             }
         }
         finally {
-            if (answer) {
-                this.history.push({ role: 'assistant', content: answer });
+            if (partial) {
+                this.history.push({ role: 'assistant', content: partial });
             }
             this.post({ type: 'end' });
+        }
+    }
+    async runMcpTool(tc, routes, cfg, signal) {
+        const route = routes.get(tc.function.name);
+        const label = route?.label ?? tc.function.name;
+        let args = {};
+        try {
+            args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+        }
+        catch {
+            return `Error: invalid JSON arguments: ${tc.function.arguments.slice(0, 200)}`;
+        }
+        const detail = JSON.stringify(args, null, 2);
+        this.post({ type: 'tool', text: `${t('toolLabel', label)}\n${detail.slice(0, 1500)}` });
+        if (!route) {
+            return `Error: unknown tool ${tc.function.name}`;
+        }
+        if (signal.aborted) {
+            return t('mcpCancelled');
+        }
+        const mode = cfg.get('permissionMode', 'off');
+        if (cfg.get('mcpConfirm', true) && mode !== 'off' && mode !== 'full') {
+            if (!(await this.askInChat(t('askMcp', label, detail.slice(0, 500)), signal))) {
+                return signal.aborted ? t('mcpCancelled') : t('mcpDenied');
+            }
+        }
+        try {
+            const out = this.truncate(await route.server.call(route.tool, args));
+            this.post({ type: 'tool', text: `${t('resultLabel', label)}\n${out.slice(0, 3000)}` });
+            return out;
+        }
+        catch (e) {
+            const msg = `Error: ${e?.message ?? e}`;
+            this.post({ type: 'tool', text: `${t('resultLabel', label)}\n${msg}` });
+            return msg;
         }
     }
 }
@@ -535,6 +845,7 @@ body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);displa
 .wait{opacity:.7;font-style:italic;animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.3}}
 .tool summary{cursor:pointer;user-select:none}
+.ask{border:1px solid var(--vscode-editorWarning-foreground,#cca700)}
 .tool .tb{margin-top:6px;white-space:pre-wrap}
 .tab .x{opacity:.7}
 #tabs button{padding:2px 8px}
@@ -586,6 +897,7 @@ button{background:var(--vscode-button-background);color:var(--vscode-button-fore
 <div style="display:flex;gap:4px"><input id="c_model" list="models" style="flex:1"><button id="loadModels" title="GET /v1/models">${t('loadModels')}</button></div>
 <datalist id="models"></datalist>
 <div style="display:flex;gap:4px;margin-top:4px"><button id="runModel" title="${t('runModelTip')}">${t('runModel')}</button></div>
+<div style="display:flex;gap:4px;margin-top:4px"><button id="openSettingsJson" title="${t('openSettingsJsonTip')}">&#123;&#125; ${t('openSettingsJson')}</button></div>
 <label>${t('runFlags')}</label><input id="c_runFlags" placeholder="-c 131072 --threads 8">
 <label>${t('systemPrompt')}</label><textarea id="c_systemPrompt" rows="3"></textarea>
 <label>${t('reasoning')}</label><select id="c_reasoningEffort"><option value="">${t('default')}</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
@@ -648,6 +960,7 @@ function fillModels(ids){sel.innerHTML='';const list=ids.slice();if(curModel&&!l
 document.getElementById('refresh').onclick=()=>vs.postMessage({type:'listModels'});
 sel.onchange=()=>{curModel=sel.value;document.getElementById('c_model').value=curModel;vs.postMessage({type:'setModel',model:curModel})};
 document.getElementById('loadModels').onclick=()=>vs.postMessage({type:'listModels'});
+document.getElementById('openSettingsJson').onclick=()=>vs.postMessage({type:'openSettingsJson'});
 document.getElementById('runModel').onclick=()=>vs.postMessage({type:'runModel',model:document.getElementById('c_model').value});
 function add(cls,t,l){l=l||log;const d=document.createElement('div');d.className='msg '+cls;d.textContent=t;l.appendChild(d);l.scrollTop=l.scrollHeight;return d}
 function addTool(t,l){const i=t.indexOf('\\n'),head=i<0?t:t.slice(0,i),body=i<0?'':t.slice(i+1);const d=document.createElement('details');d.className='msg tool';const sm=document.createElement('summary');sm.textContent=head;d.appendChild(sm);const b=document.createElement('div');b.className='tb';b.textContent=body;d.appendChild(b);l.appendChild(d);l.scrollTop=l.scrollHeight}
@@ -684,8 +997,9 @@ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();go()}
 });
 window.addEventListener('message',e=>{const m=e.data;const ch=chats[m.c]||chats[activeId];
 if(m.type==='newTab'){newTab()}
+else if(m.type==='confirm'){const d=document.createElement('div');d.className='msg tool ask';const tx=document.createElement('div');tx.style.whiteSpace='pre-wrap';tx.textContent=m.text;d.appendChild(tx);const row=document.createElement('div');row.style.cssText='display:flex;gap:6px;margin-top:6px';const done=a=>{vs0.postMessage({type:'confirmResult',id:m.id,allow:a,c:m.c});row.textContent=a?${j('allow')}:${j('deny')};d.classList.remove('ask')};const ok=document.createElement('button');ok.textContent=${j('allow')};ok.onclick=()=>done(true);const no=document.createElement('button');no.textContent=${j('deny')};no.onclick=()=>done(false);row.appendChild(ok);row.appendChild(no);d.appendChild(row);ch.log.appendChild(d);ch.log.scrollTop=ch.log.scrollHeight}
 else if(m.type==='clearActive'){vs.postMessage({type:'clear'})}
-else if(m.type==='start'){ch.cur=add('assistant',${j('waiting')},ch.log);ch.cur.classList.add('wait');ch.waiting=true;ch.busy=true;updateBusy()}
+else if(m.type==='start'){if(ch.waiting&&ch.cur)ch.cur.remove();ch.cur=add('assistant',${j('waiting')},ch.log);ch.cur.classList.add('wait');ch.waiting=true;ch.busy=true;updateBusy()}
 else if(m.type==='delta'&&ch.cur){if(ch.waiting){ch.waiting=false;ch.cur.classList.remove('wait');ch.cur.textContent=''}ch.cur.textContent+=m.text;ch.log.scrollTop=ch.log.scrollHeight}
 else if(m.type==='config'){perm=m.values.enableTools?(m.values.permissionMode||'off'):'none';renderPerm();keys.forEach(k=>setv(document.getElementById('c_'+k),m.values[k]));curModel=m.values.model||'';if(![...sel.options].some(o=>o.value===curModel)&&curModel){const o=document.createElement('option');o.value=curModel;o.textContent=curModel;sel.appendChild(o)}if(curModel)sel.value=curModel}
 else if(m.type==='saved'){const s=document.getElementById('savedMsg');s.textContent=${j('saved')};setTimeout(()=>s.textContent='',2000)}
@@ -750,6 +1064,12 @@ function activate(context) {
         if (had) {
             host.postToView({ type: 'newTab' });
         }
+    }), vscode.commands.registerCommand('unslothChat.restartMcp', () => {
+        mcpManager.reset();
+        vscode.window.showInformationMessage(t('mcpRestarted'));
     }), vscode.commands.registerCommand('unslothChat.clear', () => host.postToView({ type: 'clearActive' })));
+}
+function deactivate() {
+    mcpManager.reset();
 }
 //# sourceMappingURL=extension.js.map

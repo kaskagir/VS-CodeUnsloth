@@ -13,6 +13,7 @@ A lightweight VS Code extension that adds a chat panel for a local [Unsloth](htt
   - `auto`: only risky calls ask for confirmation
   - `off`: no prompts, sandbox stays on
   - `full` (Unsupervised): no prompts and no sandbox (dangerous)
+- **MCP tools** (e.g. [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP)): the extension starts MCP servers itself and lets the model call their tools (shell, files, ...). See [MCP tools](#mcp-tools).
 - **Collapsible tool calls and results** in the chat.
 - **Sampling settings**: temperature, max tokens, top-p, top-k, min-p, repeat penalty, seed, reasoning effort, system prompt.
 - **English and German UI**, selected automatically from the VS Code display language.
@@ -78,11 +79,45 @@ code --install-extension unsloth-chat-<version>.vsix
 
 All settings live under `unslothChat.*` in the VS Code settings (or in the gear panel of the chat):
 
-`baseUrl`, `apiKey`, `model`, `systemPrompt`, `temperature`, `maxTokens`, `topP`, `topK`, `minP`, `repeatPenalty`, `seed`, `reasoningEffort`, `enableTools`, `toolPython`, `toolWebSearch`, `toolTerminal`, `permissionMode`, `runFlags`.
+`baseUrl`, `apiKey`, `model`, `systemPrompt`, `temperature`, `maxTokens`, `topP`, `topK`, `minP`, `repeatPenalty`, `seed`, `reasoningEffort`, `enableTools`, `toolPython`, `toolWebSearch`, `toolTerminal`, `permissionMode`, `runFlags`, `mcpServers`, `mcpConfirm`, `mcpExclusive`.
+
+## MCP tools
+
+Unsloth's built-in tools run in its sandbox. To let the model work on your own files and run commands, configure MCP servers in your VS Code `settings.json`. The extension starts them (stdio), sends their tools to Unsloth as OpenAI `tools`, runs the tool calls the model requests and feeds the results back (up to 15 rounds per message).
+
+```json
+"unslothChat.mcpServers": {
+  "desktop-commander": {
+    "command": "npx",
+    "args": ["-y", "@wonderwhy-er/desktop-commander@latest"]
+  }
+}
+```
+
+**Projects in WSL** (Unsloth and VS Code on Windows): add `"wsl"` to run the MCP server inside WSL. `true` uses the default distribution, or pass a distribution name (see `wsl -l -v`). Node.js/npx must be installed inside that distribution. Optional `cwd` sets the working directory inside WSL.
+
+```json
+"unslothChat.mcpServers": {
+  "desktop-commander-wsl": {
+    "command": "npx",
+    "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
+    "wsl": "Ubuntu",
+    "cwd": "/home/<user>/project"
+  }
+}
+```
+
+The model then sees and edits WSL files by their Linux paths (e.g. `/home/<user>/project/...`) and its commands run in WSL. If you use the VS Code WSL extension instead (window connected to WSL), the chat extension must be installed in WSL too; then plain `npx` already runs in WSL and `wsl` is not needed.
+
+- `unslothChat.mcpExclusive` (default `true`): while MCP tools are available, Unsloth's built-in sandbox tools are switched off, so the model cannot fall back to the sandbox. Set it to `false` to offer both.
+- `unslothChat.mcpConfirm` (default `true`): ask with Allow/Deny buttons in the chat before MCP tool calls. This only applies to the permission modes `ask` and `auto`; with `off` and `full` (Unsupervised) MCP tools run without asking.
+- Command `Unsloth Chat: Restart MCP servers` restarts the servers, e.g. after a failed start.
+- The model must support tool calling, and your Unsloth server has to accept the `tools` parameter of the chat completions API.
 
 ## Security notes
 
 - The API key is stored in your VS Code user settings in plain text.
+- MCP servers run with your user rights and can read, change and delete files. Keep `mcpConfirm` enabled unless you trust the model.
 - The `full` permission mode runs tool calls without confirmation and without a sandbox. Use it only if you trust the model and the environment.
 
 ## Project layout

@@ -23,5 +23,11 @@
   "contributes.configuration.properties.unslothChat.toolWebSearch.description": "Tool: Websuche",
   "contributes.configuration.properties.unslothChat.toolTerminal.description": "Tool: Terminal/Bash",
   "contributes.configuration.properties.unslothChat.runFlags.description": "Zusätzliche Flags für \"unsloth run\" (z.B. -c 131072 --threads 8)",
-  "contributes.configuration.properties.unslothChat.permissionMode.description": "Berechtigung für Unsloth-Tools: off = ohne Rückfrage, auto = Rückfrage nur bei riskanten Aufrufen, ask = Rückfrage bei jedem Aufruf (Bestätigung per Dialog in VS Code). full = ohne Rückfrage und ohne Sandbox (gefährlich)."
+  "contributes.configuration.properties.unslothChat.permissionMode.description": "Berechtigung für Unsloth-Tools: off = ohne Rückfrage, auto = Rückfrage nur bei riskanten Aufrufen, ask = Rückfrage bei jedem Aufruf (Bestätigung per Dialog in VS Code). full = ohne Rückfrage und ohne Sandbox (gefährlich).",
+  "contributes.commands.3.title": "Unsloth Chat: MCP-Server neu starten",
+  "contributes.configuration.properties.unslothChat.mcpServers.description": "MCP-Server, deren Tools der Chat nutzen kann (clientseitig), z. B. {\"desktop-commander\": {\"command\": \"npx\", \"args\": [\"-y\", \"@wonderwhy-er/desktop-commander@latest\"]}}. Für WSL \"wsl.exe\" als Command verwenden.",
+  "contributes.configuration.properties.unslothChat.mcpConfirm.description": "Vor MCP-Tool-Aufrufen im Chat nachfragen (nur bei den Berechtigungsmodi \"ask\" und \"auto\"; bei \"off\" und \"full\" wird nie gefragt)",
+  "contributes.configuration.properties.unslothChat.mcpServers.wsl": "Server innerhalb von WSL starten (true = Standard-Distribution oder Name der Distribution, z. B. \"Streetbuzz\"). Wirkt nur, wenn VS Code unter Windows läuft.",
+  "contributes.configuration.properties.unslothChat.mcpServers.cwd": "Arbeitsverzeichnis (innerhalb von WSL, falls \"wsl\" gesetzt ist, z. B. /home/user/projekt)",
+  "contributes.configuration.properties.unslothChat.mcpExclusive.description": "Wenn MCP-Tools verfügbar sind, die eingebauten Sandbox-Tools von Unsloth (Python, Terminal, Websuche) nicht verwenden, damit das Modell die MCP-Tools nutzt"
 }

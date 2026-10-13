@@ -2,7 +2,7 @@
   "name": "unsloth-chat",
   "displayName": "Unsloth Chat",
   "description": "%description%",
-  "version": "0.1.11",
+  "version": "0.1.16",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
@@ -53,6 +53,10 @@
       {
         "command": "unslothChat.clear",
         "title": "%contributes.commands.2.title%"
+      },
+      {
+        "command": "unslothChat.restartMcp",
+        "title": "%contributes.commands.3.title%"
       }
     ],
     "configuration": {
@@ -174,6 +178,55 @@
             "full"
           ],
           "description": "%contributes.configuration.properties.unslothChat.permissionMode.description%"
+        },
+        "unslothChat.mcpServers": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "wsl": {
+                "type": [
+                  "boolean",
+                  "string"
+                ],
+                "description": "%contributes.configuration.properties.unslothChat.mcpServers.wsl%"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "%contributes.configuration.properties.unslothChat.mcpServers.cwd%"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "description": "%contributes.configuration.properties.unslothChat.mcpServers.description%"
+        },
+        "unslothChat.mcpConfirm": {
+          "type": "boolean",
+          "default": true,
+          "description": "%contributes.configuration.properties.unslothChat.mcpConfirm.description%"
+        },
+        "unslothChat.mcpExclusive": {
+          "type": "boolean",
+          "default": true,
+          "description": "%contributes.configuration.properties.unslothChat.mcpExclusive.description%"
         }
       }
     }
