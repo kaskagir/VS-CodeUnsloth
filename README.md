@@ -26,7 +26,7 @@ A lightweight VS Code extension that adds a chat panel for a local [Unsloth](htt
 ## Build
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/kaskagir/VS-CodeUnsloth.git
 cd VS-CodeUnsloth
 npm install
 npm run package
