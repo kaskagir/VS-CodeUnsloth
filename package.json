@@ -1,0 +1,197 @@
+{
+  "name": "unsloth-chat",
+  "displayName": "Unsloth Chat",
+  "description": "%description%",
+  "version": "0.1.11",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "unslothChat",
+          "title": "%contributes.viewsContainers.activitybar.0.title%",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "unslothChat": [
+        {
+          "type": "webview",
+          "id": "unslothChat.view",
+          "name": "%contributes.views.unslothChat.0.name%"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "unslothChat.newChat",
+          "when": "view == unslothChat.view",
+          "group": "navigation"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "unslothChat.open",
+        "title": "%contributes.commands.0.title%"
+      },
+      {
+        "command": "unslothChat.newChat",
+        "title": "%contributes.commands.1.title%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "unslothChat.clear",
+        "title": "%contributes.commands.2.title%"
+      }
+    ],
+    "configuration": {
+      "title": "%contributes.configuration.title%",
+      "properties": {
+        "unslothChat.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:8888/v1",
+          "description": "%contributes.configuration.properties.unslothChat.baseUrl.description%"
+        },
+        "unslothChat.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "%contributes.configuration.properties.unslothChat.apiKey.description%"
+        },
+        "unslothChat.model": {
+          "type": "string",
+          "default": "unsloth",
+          "description": "%contributes.configuration.properties.unslothChat.model.description%"
+        },
+        "unslothChat.systemPrompt": {
+          "type": "string",
+          "default": "Du bist ein hilfreicher Assistent.",
+          "description": "%contributes.configuration.properties.unslothChat.systemPrompt.description%"
+        },
+        "unslothChat.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "description": "%contributes.configuration.properties.unslothChat.temperature.description%"
+        },
+        "unslothChat.maxTokens": {
+          "type": "number",
+          "default": 2048,
+          "description": "%contributes.configuration.properties.unslothChat.maxTokens.description%"
+        },
+        "unslothChat.topP": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "%contributes.configuration.properties.unslothChat.topP.description%"
+        },
+        "unslothChat.topK": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "%contributes.configuration.properties.unslothChat.topK.description%"
+        },
+        "unslothChat.minP": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "%contributes.configuration.properties.unslothChat.minP.description%"
+        },
+        "unslothChat.repeatPenalty": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "%contributes.configuration.properties.unslothChat.repeatPenalty.description%"
+        },
+        "unslothChat.seed": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "%contributes.configuration.properties.unslothChat.seed.description%"
+        },
+        "unslothChat.reasoningEffort": {
+          "type": "string",
+          "default": "",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high"
+          ],
+          "description": "%contributes.configuration.properties.unslothChat.reasoningEffort.description%"
+        },
+        "unslothChat.enableTools": {
+          "type": "boolean",
+          "default": false,
+          "description": "%contributes.configuration.properties.unslothChat.enableTools.description%"
+        },
+        "unslothChat.toolPython": {
+          "type": "boolean",
+          "default": true,
+          "description": "%contributes.configuration.properties.unslothChat.toolPython.description%"
+        },
+        "unslothChat.toolWebSearch": {
+          "type": "boolean",
+          "default": true,
+          "description": "%contributes.configuration.properties.unslothChat.toolWebSearch.description%"
+        },
+        "unslothChat.toolTerminal": {
+          "type": "boolean",
+          "default": false,
+          "description": "%contributes.configuration.properties.unslothChat.toolTerminal.description%"
+        },
+        "unslothChat.runFlags": {
+          "type": "string",
+          "default": "",
+          "description": "%contributes.configuration.properties.unslothChat.runFlags.description%"
+        },
+        "unslothChat.permissionMode": {
+          "type": "string",
+          "default": "off",
+          "enum": [
+            "off",
+            "auto",
+            "ask",
+            "full"
+          ],
+          "description": "%contributes.configuration.properties.unslothChat.permissionMode.description%"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "npm version patch --no-git-tag-version && tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run compile && vsce package --allow-missing-repository --skip-license"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^4.0.0",
+    "typescript": "^5.4.0"
+  },
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://example.invalid/unsloth-chat.git"
+  }
+}
