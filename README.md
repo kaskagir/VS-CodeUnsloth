@@ -14,6 +14,7 @@ A lightweight VS Code extension that adds a chat panel for a local [Unsloth](htt
   - `off`: no prompts, sandbox stays on
   - `full` (Unsupervised): no prompts and no sandbox (dangerous)
 - **MCP tools** (e.g. [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP)): the extension starts MCP servers itself and lets the model call their tools (shell, files, ...). See [MCP tools](#mcp-tools).
+- **Project directory**: the active VS Code workspace folder (the one of the open editor, other folders are listed too) is sent to the model with every message, including the WSL path for `\\wsl$` folders.
 - **Collapsible tool calls and results** in the chat.
 - **Sampling settings**: temperature, max tokens, top-p, top-k, min-p, repeat penalty, seed, reasoning effort, system prompt.
 - **English and German UI**, selected automatically from the VS Code display language.
@@ -79,7 +80,7 @@ code --install-extension unsloth-chat-<version>.vsix
 
 All settings live under `unslothChat.*` in the VS Code settings (or in the gear panel of the chat):
 
-`baseUrl`, `apiKey`, `model`, `systemPrompt`, `temperature`, `maxTokens`, `topP`, `topK`, `minP`, `repeatPenalty`, `seed`, `reasoningEffort`, `enableTools`, `toolPython`, `toolWebSearch`, `toolTerminal`, `permissionMode`, `runFlags`, `mcpServers`, `mcpConfirm`, `mcpExclusive`.
+`baseUrl`, `apiKey`, `model`, `systemPrompt`, `temperature`, `maxTokens`, `topP`, `topK`, `minP`, `repeatPenalty`, `seed`, `reasoningEffort`, `enableTools`, `toolPython`, `toolWebSearch`, `toolTerminal`, `permissionMode`, `contextLength`, `contextTrim`, `contextBudget`, `trimKeepTurns`, `runFlags`, `mcpServers`, `mcpConfirm`, `mcpExclusive`, `mcpDescMaxLength`.
 
 ## MCP tools
 
@@ -107,7 +108,37 @@ Unsloth's built-in tools run in its sandbox. To let the model work on your own f
 }
 ```
 
+You can run several servers side by side, e.g. one for Windows projects and one for WSL projects. The model is told which server runs where and picks the one matching the path (`E:\\...` = Windows, `/home/...` = WSL):
+
+```json
+"unslothChat.mcpServers": {
+  "dc-windows": {
+    "command": "npx",
+    "args": ["-y", "@wonderwhy-er/desktop-commander@latest"]
+  },
+  "dc-wsl": {
+    "command": "npx",
+    "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
+    "wsl": "Ubuntu",
+    "cwd": "/home/<user>/project"
+  }
+}
+```
+
 The model then sees and edits WSL files by their Linux paths (e.g. `/home/<user>/project/...`) and its commands run in WSL. If you use the VS Code WSL extension instead (window connected to WSL), the chat extension must be installed in WSL too; then plain `npx` already runs in WSL and `wsl` is not needed.
+
+**Selecting tools and description length**: servers like Desktop Commander offer many tools whose definitions are sent with every request and cost context. Per server, `includeTools` (only these) and `excludeTools` (all except these) filter the tools by name, `*` works as a wildcard. `unslothChat.mcpDescMaxLength` (default `1000`, `0` = unlimited) limits the length of each tool description; `descMaxLength` overrides it per server. Changing these does not restart the server.
+
+```json
+"unslothChat.mcpServers": {
+  "desktop-commander": {
+    "command": "npx",
+    "args": ["-y", "@wonderwhy-er/desktop-commander@latest"],
+    "excludeTools": ["write_pdf", "give_feedback_*", "get_usage_stats", "get_recent_tool_calls"],
+    "descMaxLength": 2000
+  }
+}
+```
 
 - `unslothChat.mcpExclusive` (default `true`): while MCP tools are available, Unsloth's built-in sandbox tools are switched off, so the model cannot fall back to the sandbox. Set it to `false` to offer both.
 - `unslothChat.mcpConfirm` (default `true`): ask with Allow/Deny buttons in the chat before MCP tool calls. This only applies to the permission modes `ask` and `auto`; with `off` and `full` (Unsupervised) MCP tools run without asking.

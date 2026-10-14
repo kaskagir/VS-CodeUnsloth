@@ -2,7 +2,7 @@
   "name": "unsloth-chat",
   "displayName": "Unsloth Chat",
   "description": "%description%",
-  "version": "0.1.16",
+  "version": "0.1.26",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
@@ -163,6 +163,38 @@
           "default": false,
           "description": "%contributes.configuration.properties.unslothChat.toolTerminal.description%"
         },
+        "unslothChat.contextLength": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "%contributes.configuration.properties.unslothChat.contextLength.description%"
+        },
+        "unslothChat.contextTrim": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "onError",
+            "off"
+          ],
+          "description": "%contributes.configuration.properties.unslothChat.contextTrim.description%"
+        },
+        "unslothChat.contextBudget": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "%contributes.configuration.properties.unslothChat.contextBudget.description%"
+        },
+        "unslothChat.trimKeepTurns": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "description": "%contributes.configuration.properties.unslothChat.trimKeepTurns.description%"
+        },
         "unslothChat.runFlags": {
           "type": "string",
           "default": "",
@@ -210,6 +242,25 @@
               "cwd": {
                 "type": "string",
                 "description": "%contributes.configuration.properties.unslothChat.mcpServers.cwd%"
+              },
+              "includeTools": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "%contributes.configuration.properties.unslothChat.mcpServers.includeTools%"
+              },
+              "excludeTools": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "%contributes.configuration.properties.unslothChat.mcpServers.excludeTools%"
+              },
+              "descMaxLength": {
+                "type": "number",
+                "minimum": 0,
+                "description": "%contributes.configuration.properties.unslothChat.mcpServers.descMaxLength%"
               }
             },
             "required": [
@@ -223,10 +274,28 @@
           "default": true,
           "description": "%contributes.configuration.properties.unslothChat.mcpConfirm.description%"
         },
+        "unslothChat.mcpDescMaxLength": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 0,
+          "description": "%contributes.configuration.properties.unslothChat.mcpDescMaxLength.description%"
+        },
         "unslothChat.mcpExclusive": {
           "type": "boolean",
           "default": true,
           "description": "%contributes.configuration.properties.unslothChat.mcpExclusive.description%"
+        },
+        "unslothChat.mcpHint": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "description": "%contributes.configuration.properties.unslothChat.mcpHint.description%"
+        },
+        "unslothChat.mcpHintExclusive": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "description": "%contributes.configuration.properties.unslothChat.mcpHintExclusive.description%"
         }
       }
     }

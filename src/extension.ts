@@ -20,6 +20,13 @@ interface McpCfg {
   env?: Record<string, string>;
   wsl?: boolean | string;
   cwd?: string;
+  includeTools?: string[];
+  excludeTools?: string[];
+  descMaxLength?: number;
+}
+
+function toolMatch(name: string, patterns?: string[]): boolean {
+  return (patterns ?? []).some(p => new RegExp('^' + String(p).replace(/[.+?^$(){}|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(name));
 }
 
 class McpServer {
@@ -31,6 +38,13 @@ class McpServer {
   private stderr = '';
 
   constructor(readonly name: string, private readonly cfg: McpCfg) {}
+
+  get env(): string {
+    if (this.cfg.wsl && process.platform === 'win32') {
+      return 'WSL/Linux, only Linux paths; Windows drives are mounted, so E:\\ki-test\\app must be used as /mnt/e/ki-test/app';
+    }
+    return process.platform === 'win32' ? 'Windows, paths like E:\\folder\\file' : 'local machine';
+  }
 
   async start(): Promise<void> {
     const win = process.platform === 'win32';
@@ -132,14 +146,14 @@ class McpManager {
   private key = '';
   private lock: Promise<unknown> = Promise.resolve();
 
-  sync(raw: Record<string, McpCfg>): Promise<{ defs: any[]; routes: Map<string, McpRoute>; errors: string[] }> {
-    const run = this.lock.then(() => this.doSync(raw));
+  sync(raw: Record<string, McpCfg>, descMax = 1000): Promise<{ defs: any[]; routes: Map<string, McpRoute>; errors: string[] }> {
+    const run = this.lock.then(() => this.doSync(raw, descMax));
     this.lock = run.catch(() => undefined);
     return run;
   }
 
-  private async doSync(raw: Record<string, McpCfg>) {
-    const key = JSON.stringify(raw ?? {});
+  private async doSync(raw: Record<string, McpCfg>, descMax: number) {
+    const key = JSON.stringify(Object.entries(raw ?? {}).map(([n, c]) => [n, c?.command, c?.args, c?.env, c?.wsl, c?.cwd]));
     if (key !== this.key) {
       this.reset();
       this.key = key;
@@ -166,14 +180,20 @@ class McpManager {
     const defs: any[] = [];
     const routes = new Map<string, McpRoute>();
     for (const [name, srv] of this.servers) {
+      const sc = raw?.[name];
+      const max = typeof sc?.descMaxLength === 'number' ? sc.descMaxLength : descMax;
       for (const t of srv.tools) {
+        if ((sc?.includeTools?.length && !toolMatch(t.name, sc.includeTools)) || toolMatch(t.name, sc?.excludeTools)) {
+          continue;
+        }
         const fn = `${name}__${t.name}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
         routes.set(fn, { server: srv, tool: t.name, label: `${name}/${t.name}` });
+        const desc = String(t.description ?? '');
         defs.push({
           type: 'function',
           function: {
             name: fn,
-            description: String(t.description ?? '').slice(0, 1000),
+            description: max > 0 && desc.length > max ? `${desc.slice(0, max)}...` : desc,
             parameters: t.inputSchema ?? { type: 'object', properties: {} }
           }
         });
@@ -190,11 +210,76 @@ class McpManager {
 }
 
 const mcpManager = new McpManager();
+let serverCtx = 0;
 
-const FIELDS: Record<string, 's' | 'n' | 'b'> = {
-  baseUrl: 's', apiKey: 's', model: 's', systemPrompt: 's', reasoningEffort: 's', runFlags: 's',
+function streamError(data: string): string {
+  try {
+    const j = JSON.parse(data);
+    const e = j?.error ?? j;
+    const msg = typeof e === 'string' ? e : e?.message ?? e?.detail;
+    if (msg) {
+      const code = typeof e === 'object' ? e?.code ?? e?.type : undefined;
+      return `${t('serverError')}${code ? ` (${code})` : ''}: ${msg}\n${data}`;
+    }
+  } catch {
+    // kein JSON, Rohtext anzeigen
+  }
+  return `${t('serverError')}: ${data}`;
+}
+
+function estTokens(messages: ChatMessage[], extraChars: number): number {
+  let chars = extraChars;
+  for (const m of messages) {
+    chars += (m.content?.length ?? 0) + 16;
+    for (const tc of m.tool_calls ?? []) {
+      chars += tc.function.name.length + tc.function.arguments.length + 16;
+    }
+  }
+  return Math.ceil(chars / 3.5);
+}
+
+function trimMessages(messages: ChatMessage[], limit: number, keepTurns: number, extraChars: number, ratio = 1): [number, number] {
+  const est = () => estTokens(messages, extraChars) * ratio;
+  const start = messages.findIndex(m => m.role !== 'system');
+  let dropped = 0;
+  let shortened = 0;
+  if (start < 0 || est() <= limit) {
+    return [0, 0];
+  }
+  const turns = () => messages.slice(start).filter(m => m.role === 'user').length;
+  while (est() > limit && turns() > Math.max(1, keepTurns)) {
+    let n = 1;
+    while (start + n < messages.length && messages[start + n].role !== 'user') {
+      n++;
+    }
+    messages.splice(start, n);
+    dropped += n;
+  }
+  const lastUser = messages.map(m => m.role).lastIndexOf('user');
+  while (est() > limit) {
+    let big = -1;
+    for (let i = start; i < messages.length; i++) {
+      const len = messages[i].content?.length ?? 0;
+      if (i !== lastUser && len > 1000 && (big < 0 || len > (messages[big].content?.length ?? 0))) {
+        big = i;
+      }
+    }
+    if (big < 0) {
+      break;
+    }
+    const c = messages[big].content ?? '';
+    messages[big] = { ...messages[big], content: `${c.slice(0, Math.floor(c.length / 2))}\n${t('truncated')}` };
+    shortened++;
+  }
+  return [dropped, shortened];
+}
+
+const FIELDS: Record<string, 's' | 'n' | 'b' | 'j'> = {
+  baseUrl: 's', apiKey: 's', model: 's', systemPrompt: 's', reasoningEffort: 's', runFlags: 's', contextLength: 'n',
+  contextTrim: 's', contextBudget: 'n', trimKeepTurns: 'n',
   temperature: 'n', maxTokens: 'n', topP: 'n', topK: 'n', minP: 'n', repeatPenalty: 'n', seed: 'n',
-  enableTools: 'b', permissionMode: 's', toolPython: 'b', toolWebSearch: 'b', toolTerminal: 'b'
+  enableTools: 'b', permissionMode: 's', toolPython: 'b', toolWebSearch: 'b', toolTerminal: 'b',
+  mcpServers: 'j', mcpConfirm: 'b', mcpExclusive: 'b', mcpHint: 's', mcpHintExclusive: 's', mcpDescMaxLength: 'n'
 };
 
 const I18N: Record<string, [string, string]> = {
@@ -227,12 +312,28 @@ const I18N: Record<string, [string, string]> = {
   openSettingsJson: ["MCP-Server in settings.json eintragen", "Edit MCP servers in settings.json"],
   openSettingsJsonTip: ["Öffnet die settings.json (Einstellung unslothChat.mcpServers)", "Opens settings.json (setting unslothChat.mcpServers)"],
   runFlags: ["Zusätzliche Flags für \"unsloth run\"", "Additional flags for \"unsloth run\""],
+  contextLength: ["Kontextlänge (Tokens, -c)", "Context length (tokens, -c)"],
+  contextTrim: ["Kontext automatisch kürzen", "Trim context automatically"],
+  ctOff: ["Aus", "Off"],
+  ctOnError: ["Nur bei Fehler \"Kontext zu groß\"", "Only on \"context too large\" error"],
+  ctAuto: ["Automatisch (vorab + bei Fehler)", "Automatic (upfront + on error)"],
+  contextBudget: ["Token-Budget fürs Kürzen (leer = Kontextlänge bzw. vom Server gemeldet)", "Token budget for trimming (empty = context length or reported by server)"],
+  trimKeepTurns: ["Letzte Runden nie entfernen", "Never remove last turns"],
+  serverError: ["Fehler vom Server", "Server error"],
+  trimmed: ["Kontext gekürzt: {0} ältere Nachrichten entfernt, {1} Inhalte verkürzt.", "Context trimmed: {0} older messages removed, {1} contents shortened."],
   systemPrompt: ["System-Prompt", "System prompt"],
   reasoning: ["Reasoning-Aufwand", "Reasoning effort"],
   default: ["Standard", "Default"],
   temperature: ["Temperatur", "Temperature"],
   maxTokens: ["Max. Tokens", "Max. tokens"],
   random: ["zufällig", "random"],
+  mcpServers: ["MCP-Server (JSON)", "MCP servers (JSON)"],
+  mcpConfirm: ["MCP-Tools vor Ausführung bestätigen", "Confirm MCP tools before running"],
+  mcpExclusive: ["Nur MCP-Tools verwenden (keine Sandbox)", "MCP tools only (no sandbox)"],
+  mcpDescMaxLength: ["Max. Länge der MCP-Tool-Beschreibungen (Zeichen, 0 = unbegrenzt)", "Max. length of MCP tool descriptions (chars, 0 = unlimited)"],
+  mcpHintLbl: ["MCP-Hinweistext ({0} = Server, {1} = Zusatz; leer = Standard)", "MCP hint text ({0} = servers, {1} = addition; empty = default)"],
+  mcpHintExclLbl: ["MCP-Hinweis-Zusatz bei exklusiv ({1}; leer = Standard)", "MCP exclusive addition ({1}; empty = default)"],
+  badJson: ["MCP-Server: ungültiges JSON", "MCP servers: invalid JSON"],
   enableTools: ["Unsloth-Tools aktivieren (serverseitig)", "Enable Unsloth tools (server-side)"],
   webSearch: ["Websuche", "Web search"],
   permMode: ["Berechtigungsmodus für Tools", "Permission mode for tools"],
@@ -266,8 +367,14 @@ const I18N: Record<string, [string, string]> = {
   mcpDenied: ["Vom Benutzer abgelehnt.", "Denied by user."],
   mcpLimit: ["Maximale Anzahl Tool-Runden erreicht.", "Maximum number of tool rounds reached."],
   mcpRestarted: ["MCP-Server werden beim nächsten Senden neu gestartet.", "MCP servers will be restarted on next send."],
-  mcpHint: ["Du hast Zugriff auf Tools des Benutzerrechners (MCP-Server: {0}). Nutze sie für alle Datei- und Befehlsaufgaben und verwende Pfade genau so, wie der Benutzer sie nennt. {1}", "You have access to tools on the user's own machine (MCP servers: {0}). Use them for all file and command tasks and use paths exactly as the user gives them. {1}"],
+  mcpHint: ["Du hast Zugriff auf Tools des Benutzerrechners (MCP-Server: {0}). Nutze sie für alle Datei- und Befehlsaufgaben, verwende Pfade genau so, wie der Benutzer sie nennt, und wähle den Server, dessen Umgebung zum Pfad passt (z. B. E:\\... = Windows, /home/... = WSL). {1}", "You have access to tools on the user's own machine (MCP servers: {0}). Use them for all file and command tasks, use paths exactly as the user gives them, and pick the server whose environment matches the path (e.g. E:\\... = Windows, /home/... = WSL). {1}"],
   mcpHintExcl: ["Es gibt keine Sandbox; versuche nicht, Python- oder Terminal-Tools der Sandbox zu verwenden.", "There is no sandbox; do not try sandbox Python or terminal tools."],
+  projectDir: ["Aktives Projektverzeichnis in VS Code: {0}. Beziehe relative Pfade und Aufgaben darauf, sofern der Benutzer nichts anderes sagt.", "Active project directory in VS Code: {0}. Resolve relative paths and tasks against it unless the user says otherwise."],
+  projectOthers: ["Weitere Workspace-Ordner: {0}.", "Other workspace folders: {0}."],
+  thinking: ["Denkt nach …", "Thinking …"],
+  thought: ["Gedankengang", "Reasoning"],
+  promptProgress: ["Prompt wird verarbeitet: {0} %", "Processing prompt: {0} %"],
+  speed: ["{0} Tokens · {1} tok/s", "{0} tokens · {1} tok/s"],
   waiting: ["Warte auf Antwort von Unsloth …", "Waiting for response from Unsloth …"],
 };
 
@@ -279,6 +386,22 @@ function t(key: string, ...args: unknown[]): string {
 
 function j(key: string): string {
   return JSON.stringify(t(key)).replace(/</g, '\\u003c');
+}
+
+function projectInfo(): string {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (!folders.length) {
+    return '';
+  }
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  const active = (activeUri && vscode.workspace.getWorkspaceFolder(activeUri)) || folders[0];
+  const describe = (f: vscode.WorkspaceFolder): string => {
+    const p = f.uri.fsPath;
+    const m = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)(\\.*)?$/i.exec(p);
+    return m ? `${p} (WSL ${m[1]}: ${(m[2] ?? '/').replace(/\\/g, '/')})` : p;
+  };
+  const others = folders.filter(f => f !== active).map(describe);
+  return t('projectDir', describe(active)) + (others.length ? ' ' + t('projectOthers', others.join(', ')) : '');
 }
 
 function activeFileMsg(): { type: string; path: string | null } {
@@ -481,7 +604,8 @@ class ChatEngine {
     const cfg = vscode.workspace.getConfiguration('unslothChat');
     const values: Record<string, unknown> = {};
     for (const k of Object.keys(FIELDS)) {
-      values[k] = cfg.get(k);
+      const v = cfg.get(k);
+      values[k] = FIELDS[k] === 'j' ? JSON.stringify(v ?? {}, null, 2) : v;
     }
     this.post({ type: 'config', values });
   }
@@ -495,6 +619,15 @@ class ChatEngine {
           await cfg.update(k, v, vscode.ConfigurationTarget.Global);
         } else if (kind === 'b' && typeof v === 'boolean') {
           await cfg.update(k, v, vscode.ConfigurationTarget.Global);
+        } else if (kind === 'j' && typeof v === 'string') {
+          const txt = v.trim();
+          let parsed: unknown;
+          try { parsed = txt ? JSON.parse(txt) : {}; } catch { this.post({ type: 'error', text: t('badJson') }); continue; }
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            await cfg.update(k, parsed, vscode.ConfigurationTarget.Global);
+          } else {
+            this.post({ type: 'error', text: t('badJson') });
+          }
         } else if (kind === 'n') {
           if (v === '' || v === null || v === undefined) {
             await cfg.update(k, undefined, vscode.ConfigurationTarget.Global);
@@ -550,9 +683,12 @@ class ChatEngine {
       this.post({ type: 'error', text: t('errFlags') });
       return;
     }
+    const ctx = cfg.get<number | null>('contextLength', null);
+    const ctxFlag = typeof ctx === 'number' && Number.isInteger(ctx) && ctx > 0 ? ` -c ${ctx}` : '';
+    serverCtx = 0;
     const term = vscode.window.createTerminal('Unsloth');
     term.show();
-    term.sendText(`unsloth run --model ${model}${flags ? ' ' + flags : ''}`);
+    term.sendText(`unsloth run --model ${model}${ctxFlag}${flags ? ' ' + flags : ''}`);
     this.post({ type: 'info', text: t('termStarted', model) });
   }
 
@@ -628,6 +764,24 @@ class ChatEngine {
       if (r) {
         this.post({ type: 'tool', text: `${t('resultLabel', ev.tool_name ?? 'tool')}\n${r.slice(0, 3000)}` });
       }
+    } else {
+      // Unbekannte Server-Ereignisse als Statuszeile anzeigen
+      const msg = ev.message ?? ev.status ?? ev.text ?? ev.detail;
+      const text = typeof msg === 'string' && msg ? `${ev.type}: ${msg}` : String(ev.type);
+      this.post({ type: 'status', text: text.slice(0, 300) });
+    }
+  }
+
+  /** Prompt-Fortschritt und Geschwindigkeit (llama.cpp-Felder), falls der Server sie mitsendet. */
+  private postProgress(json: any): void {
+    const p = json?.prompt_progress;
+    if (p && p.total > 0) {
+      const pct = Math.min(100, Math.round(((p.processed ?? 0) / p.total) * 100));
+      this.post({ type: 'status', text: t('promptProgress', pct) });
+    }
+    const tm = json?.timings;
+    if (tm && typeof tm.predicted_per_second === 'number' && tm.predicted_n > 0) {
+      this.post({ type: 'status', final: true, text: t('speed', tm.predicted_n, tm.predicted_per_second.toFixed(1)) });
     }
   }
 
@@ -688,13 +842,24 @@ class ChatEngine {
     const signal = this.abort.signal;
     let partial = '';
     try {
-      const mcp = await mcpManager.sync(cfg.get<Record<string, McpCfg>>('mcpServers', {}) ?? {});
+      const mcp = await mcpManager.sync(cfg.get<Record<string, McpCfg>>('mcpServers', {}) ?? {}, cfg.get<number>('mcpDescMaxLength', 1000) ?? 1000);
       for (const err of mcp.errors) {
         this.post({ type: 'error', text: t('mcpFailed', err) });
       }
+      const proj = projectInfo();
+      if (proj) {
+        if (messages[0]?.role === 'system') {
+          messages[0] = { ...messages[0], content: `${messages[0].content}\n\n${proj}` };
+        } else {
+          messages.unshift({ role: 'system', content: proj });
+        }
+      }
       const exclusive = mcp.defs.length > 0 && cfg.get<boolean>('mcpExclusive', true);
       if (mcp.defs.length) {
-        const hint = t('mcpHint', [...new Set([...mcp.routes.values()].map(r => r.server.name))].join(', '), exclusive ? t('mcpHintExcl') : '');
+        const servers = [...new Set([...mcp.routes.values()].map(r => r.server))].map(sv => `${sv.name} (${sv.env})`).join('; ');
+        const extra = exclusive ? (cfg.get<string>('mcpHintExclusive', '').trim() || t('mcpHintExcl')) : '';
+        const custom = cfg.get<string>('mcpHint', '').trim();
+        const hint = custom ? custom.replace(/\{([01])\}/g, (_m, i) => (i === '0' ? servers : extra)) : t('mcpHint', servers, extra);
         if (messages[0]?.role === 'system') {
           messages[0] = { ...messages[0], content: `${messages[0].content}\n\n${hint}` };
         } else {
@@ -704,26 +869,65 @@ class ChatEngine {
       if (exclusive) {
         delete headers['X-Unsloth-Events'];
       }
+      const trimMode = cfg.get<string>('contextTrim', 'auto');
+      const keepTurns = cfg.get<number>('trimKeepTurns', 2);
+      const maxTok = cfg.get<number>('maxTokens', 2048);
+      const toolChars = mcp.defs.length ? JSON.stringify(mcp.defs).length : 0;
+      const reserve = (limit: number) => Math.min(maxTok, Math.floor(limit / 4));
+      const notify = ([d, s]: [number, number]) => {
+        if (d || s) {
+          this.post({ type: 'tool', text: t('trimmed', d, s) });
+        }
+        return d + s > 0;
+      };
       for (let round = 0; round < 15; round++) {
         this.post({ type: 'start' });
-        const body = this.buildBody(cfg, messages);
-        if (exclusive) {
-          delete body.enable_tools;
-          delete body.enabled_tools;
-          delete body.session_id;
-          delete body.permission_mode;
+        let res: Response;
+        for (let attempt = 0; ; attempt++) {
+          if (trimMode === 'auto') {
+            const limit = cfg.get<number | null>('contextBudget', null) || cfg.get<number | null>('contextLength', null) || serverCtx;
+            if (limit && limit > 0) {
+              notify(trimMessages(messages, limit - reserve(limit), keepTurns, toolChars));
+            }
+          }
+          const body = this.buildBody(cfg, messages);
+          if (exclusive) {
+            delete body.enable_tools;
+            delete body.enabled_tools;
+            delete body.session_id;
+            delete body.permission_mode;
+          }
+          if (mcp.defs.length) {
+            body.tools = mcp.defs;
+          }
+          res = await fetch(`${baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers,
+            signal,
+            body: JSON.stringify(body)
+          });
+          if (res.ok && res.body) {
+            break;
+          }
+          const errText = await res.text();
+          if (trimMode !== 'off' && attempt < 3) {
+            let err: any;
+            try { err = JSON.parse(errText); err = err?.error ?? err; } catch { err = undefined; }
+            const nCtx = Number(err?.n_ctx);
+            const nPrompt = Number(err?.n_prompt_tokens);
+            if (err?.type === 'exceed_context_size_error' && nCtx > 0 && nPrompt > 0) {
+              serverCtx = nCtx;
+              this.post({ type: 'error', text: `HTTP ${res.status} ${res.statusText}: ${errText}` });
+              const ratio = nPrompt / Math.max(1, estTokens(messages, toolChars));
+              if (notify(trimMessages(messages, nCtx - reserve(nCtx), keepTurns, toolChars, ratio))) {
+                continue;
+              }
+            }
+          }
+          throw new Error(`HTTP ${res.status} ${res.statusText}: ${errText}`);
         }
-        if (mcp.defs.length) {
-          body.tools = mcp.defs;
-        }
-        const res = await fetch(`${baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers,
-          signal,
-          body: JSON.stringify(body)
-        });
-        if (!res.ok || !res.body) {
-          throw new Error(`HTTP ${res.status} ${res.statusText}: ${await res.text()}`);
+        if (!res.body) {
+          throw new Error('empty response');
         }
         const calls = new Map<number, ToolCall>();
         const reader = res.body.getReader();
@@ -731,28 +935,42 @@ class ChatEngine {
         let buffer = '';
         for (;;) {
           const { done, value } = await reader.read();
-          if (done) {
-            break;
-          }
-          buffer += decoder.decode(value, { stream: true });
+          buffer += done ? `${decoder.decode()}\n` : decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
           buffer = lines.pop() ?? '';
           for (const raw of lines) {
             const line = raw.trim();
-            if (!line.startsWith('data:')) {
+            const isErr = line.startsWith('error:');
+            if (!line.startsWith('data:') && !isErr) {
+              if (line.startsWith('{') && line.includes('"error"')) {
+                this.post({ type: 'error', text: streamError(line) });
+              }
               continue;
             }
-            const data = line.slice(5).trim();
+            const data = line.slice(isErr ? 6 : 5).trim();
             if (data === '[DONE]') {
+              continue;
+            }
+            if (isErr) {
+              this.post({ type: 'error', text: streamError(data) });
               continue;
             }
             try {
               const json = JSON.parse(data);
+              if (json?.error || json?.type === 'error') {
+                this.post({ type: 'error', text: streamError(data) });
+                continue;
+              }
               if (json && typeof json.type === 'string' && !json.choices) {
                 await this.handleToolEvent(json);
                 continue;
               }
+              this.postProgress(json);
               const d = json.choices?.[0]?.delta;
+              const thinking = d?.reasoning_content ?? d?.reasoning;
+              if (typeof thinking === 'string' && thinking) {
+                this.post({ type: 'think', text: thinking });
+              }
               if (d?.content) {
                 partial += d.content;
                 this.post({ type: 'delta', text: d.content });
@@ -768,6 +986,9 @@ class ChatEngine {
             } catch {
               // unvollständiger Chunk ignorieren
             }
+          }
+          if (done) {
+            break;
           }
         }
         const toolCalls = [...calls.entries()].sort((x, y) => x[0] - y[0]).map(([i, c]) => ({
@@ -841,6 +1062,7 @@ class ChatEngine {
 
 function chatHtml(): string {
     const nonce = Math.random().toString(36).slice(2);
+    const version = vscode.extensions.getExtension('local.unsloth-chat')?.packageJSON?.version ?? '?';
     return `<!DOCTYPE html>
 <html lang="de"><head><meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
@@ -852,7 +1074,11 @@ body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);displa
 .tab.on{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
 .wait{opacity:.7;font-style:italic;animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.3}}
-.tool summary{cursor:pointer;user-select:none}
+.tool summary,.think summary{cursor:pointer;user-select:none}
+.think{opacity:.75;font-size:.95em}
+.think .tb{margin-top:6px;white-space:pre-wrap;max-height:240px;overflow-y:auto;font-style:italic}
+.think.live summary{animation:pulse 1.2s ease-in-out infinite}
+.status{opacity:.6;font-size:11px;padding:2px 4px}
 .ask{border:1px solid var(--vscode-editorWarning-foreground,#cca700)}
 .tool .tb{margin-top:6px;white-space:pre-wrap}
 .tab .x{opacity:.7}
@@ -897,7 +1123,7 @@ button{background:var(--vscode-button-background);color:var(--vscode-button-fore
 .mi.sel{background:var(--vscode-menu-selectionBackground,var(--vscode-list-hoverBackground));color:var(--vscode-menu-selectionForeground,inherit)}
 .mi .k{opacity:.6;margin-right:4px}
 </style></head><body>
-<div id="top"><span style="flex:1"></span><button id="refresh" title="${t('refreshTip')}">&#8635;</button><button id="gear" title="${t('settings')}">&#9881;</button></div>
+<div id="top"><span style="opacity:.6;font-size:11px">v${version}</span><span style="flex:1"></span><button id="refresh" title="${t('refreshTip')}">&#8635;</button><button id="gear" title="${t('settings')}">&#9881;</button></div>
 <div id="cfg">
 <label>${t('baseUrl')}</label><input id="c_baseUrl">
 <label>API-Key (sk-unsloth-...)</label><input id="c_apiKey" type="password">
@@ -906,7 +1132,11 @@ button{background:var(--vscode-button-background);color:var(--vscode-button-fore
 <datalist id="models"></datalist>
 <div style="display:flex;gap:4px;margin-top:4px"><button id="runModel" title="${t('runModelTip')}">${t('runModel')}</button></div>
 <div style="display:flex;gap:4px;margin-top:4px"><button id="openSettingsJson" title="${t('openSettingsJsonTip')}">&#123;&#125; ${t('openSettingsJson')}</button></div>
-<label>${t('runFlags')}</label><input id="c_runFlags" placeholder="-c 131072 --threads 8">
+<label>${t('contextLength')}</label><input id="c_contextLength" type="number" step="1024" min="0" placeholder="131072">
+<label>${t('runFlags')}</label><input id="c_runFlags" placeholder="--threads 8">
+<label>${t('contextTrim')}</label><select id="c_contextTrim"><option value="auto">${t('ctAuto')}</option><option value="onError">${t('ctOnError')}</option><option value="off">${t('ctOff')}</option></select>
+<label>${t('contextBudget')}</label><input id="c_contextBudget" type="number" step="1024" min="0" placeholder="${t('default')}">
+<label>${t('trimKeepTurns')}</label><input id="c_trimKeepTurns" type="number" step="1" min="1">
 <label>${t('systemPrompt')}</label><textarea id="c_systemPrompt" rows="3"></textarea>
 <label>${t('reasoning')}</label><select id="c_reasoningEffort"><option value="">${t('default')}</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
 <label>${t('temperature')}</label><input id="c_temperature" type="number" step="0.1" min="0" max="2">
@@ -921,6 +1151,12 @@ button{background:var(--vscode-button-background);color:var(--vscode-button-fore
 <label style="margin-left:16px"><input type="checkbox" id="c_toolWebSearch"> ${t('webSearch')}</label>
 <label style="margin-left:16px"><input type="checkbox" id="c_toolTerminal"> Terminal (Bash)</label>
 <label>${t('permMode')}</label><select id="c_permissionMode"><option value="off">${t('pmOff')}</option><option value="full">${t('pmFull')}</option><option value="auto">${t('pmAuto')}</option><option value="ask">${t('pmAsk')}</option></select>
+<label>${t('mcpServers')}</label><textarea id="c_mcpServers" rows="5" spellcheck="false"></textarea>
+<label><input type="checkbox" id="c_mcpConfirm"> ${t('mcpConfirm')}</label>
+<label><input type="checkbox" id="c_mcpExclusive"> ${t('mcpExclusive')}</label>
+<label>${t('mcpDescMaxLength')}</label><input id="c_mcpDescMaxLength" type="number" step="100" min="0">
+<label>${t('mcpHintLbl')}</label><textarea id="c_mcpHint" rows="4"></textarea>
+<label>${t('mcpHintExclLbl')}</label><textarea id="c_mcpHintExclusive" rows="2"></textarea>
 <div style="margin-top:8px"><button id="save">${t('save')}</button> <span id="savedMsg"></span></div>
 </div>
 <div id="tabs"></div>
@@ -944,7 +1180,7 @@ function selectTab(id){activeId=id;log=chats[id].log;for(const k in chats)chats[
 function newTab(){const id='c'+(++seq)+'_'+Date.now().toString(36);const l=document.createElement('div');l.className='lg';document.body.insertBefore(l,document.getElementById('activeFileBar'));chats[id]={log:l,cur:null,busy:false,named:false,title:'Chat '+seq};selectTab(id)}
 function closeTab(id){vs0.postMessage({type:'closeChat',c:id});chats[id].log.remove();delete chats[id];const ks=Object.keys(chats);if(!ks.length)newTab();else if(activeId===id)selectTab(ks[ks.length-1]);else renderTabs()}
 newTab();
-const keys=['baseUrl','apiKey','model','systemPrompt','reasoningEffort','runFlags','temperature','maxTokens','topP','topK','minP','repeatPenalty','seed','enableTools','toolPython','toolWebSearch','toolTerminal','permissionMode'],val=el=>el.type==='checkbox'?el.checked:el.value,setv=(el,v)=>{if(el.type==='checkbox')el.checked=!!v;else el.value=v??''},cfgEl=document.getElementById('cfg');
+const keys=['baseUrl','apiKey','model','systemPrompt','reasoningEffort','runFlags','contextLength','contextTrim','contextBudget','trimKeepTurns','temperature','maxTokens','topP','topK','minP','repeatPenalty','seed','enableTools','toolPython','toolWebSearch','toolTerminal','permissionMode','mcpServers','mcpConfirm','mcpExclusive','mcpHint','mcpHintExclusive','mcpDescMaxLength'],val=el=>el.type==='checkbox'?el.checked:el.value,setv=(el,v)=>{if(el.type==='checkbox')el.checked=!!v;else el.value=v??''},cfgEl=document.getElementById('cfg');
 document.getElementById('gear').onclick=()=>{cfgEl.style.display=cfgEl.style.display==='block'?'none':'block'};
 document.getElementById('save').onclick=()=>{const v={};keys.forEach(k=>v[k]=val(document.getElementById('c_'+k)));vs.postMessage({type:'saveConfig',values:v})};
 vs.postMessage({type:'getConfig'});
@@ -971,6 +1207,8 @@ document.getElementById('loadModels').onclick=()=>vs.postMessage({type:'listMode
 document.getElementById('openSettingsJson').onclick=()=>vs.postMessage({type:'openSettingsJson'});
 document.getElementById('runModel').onclick=()=>vs.postMessage({type:'runModel',model:document.getElementById('c_model').value});
 function add(cls,t,l){l=l||log;const d=document.createElement('div');d.className='msg '+cls;d.textContent=t;l.appendChild(d);l.scrollTop=l.scrollHeight;return d}
+function endThink(ch){const k=ch.think;if(!k)return;ch.think=null;k.d.classList.remove('live');k.d.open=false;k.sm.textContent=${j('thought')}+' ('+k.n+')'}
+function dropStatus(ch){if(ch.st){ch.st.remove();ch.st=null}}
 function addTool(t,l){const i=t.indexOf('\\n'),head=i<0?t:t.slice(0,i),body=i<0?'':t.slice(i+1);const d=document.createElement('details');d.className='msg tool';const sm=document.createElement('summary');sm.textContent=head;d.appendChild(sm);const b=document.createElement('div');b.className='tb';b.textContent=body;d.appendChild(b);l.appendChild(d);l.scrollTop=l.scrollHeight}
 let activeFilePath=null,attachActive=true;
 const afBar=document.getElementById('activeFileBar'),afChip=document.getElementById('activeFileChip'),afName=document.getElementById('activeFileName');
@@ -1007,8 +1245,10 @@ window.addEventListener('message',e=>{const m=e.data;const ch=chats[m.c]||chats[
 if(m.type==='newTab'){newTab()}
 else if(m.type==='confirm'){const d=document.createElement('div');d.className='msg tool ask';const tx=document.createElement('div');tx.style.whiteSpace='pre-wrap';tx.textContent=m.text;d.appendChild(tx);const row=document.createElement('div');row.style.cssText='display:flex;gap:6px;margin-top:6px';const done=a=>{vs0.postMessage({type:'confirmResult',id:m.id,allow:a,c:m.c});row.textContent=a?${j('allow')}:${j('deny')};d.classList.remove('ask')};const ok=document.createElement('button');ok.textContent=${j('allow')};ok.onclick=()=>done(true);const no=document.createElement('button');no.textContent=${j('deny')};no.onclick=()=>done(false);row.appendChild(ok);row.appendChild(no);d.appendChild(row);ch.log.appendChild(d);ch.log.scrollTop=ch.log.scrollHeight}
 else if(m.type==='clearActive'){vs.postMessage({type:'clear'})}
-else if(m.type==='start'){if(ch.waiting&&ch.cur)ch.cur.remove();ch.cur=add('assistant',${j('waiting')},ch.log);ch.cur.classList.add('wait');ch.waiting=true;ch.busy=true;updateBusy()}
-else if(m.type==='delta'&&ch.cur){if(ch.waiting){ch.waiting=false;ch.cur.classList.remove('wait');ch.cur.textContent=''}ch.cur.textContent+=m.text;ch.log.scrollTop=ch.log.scrollHeight}
+else if(m.type==='start'){endThink(ch);dropStatus(ch);if(ch.waiting&&ch.cur)ch.cur.remove();ch.cur=add('assistant',${j('waiting')},ch.log);ch.cur.classList.add('wait');ch.waiting=true;ch.busy=true;updateBusy()}
+else if(m.type==='think'){if(!ch.think){const d=document.createElement('details');d.className='msg think live';d.open=true;const sm=document.createElement('summary');sm.textContent=${j('thinking')};const b=document.createElement('div');b.className='tb';d.appendChild(sm);d.appendChild(b);if(ch.waiting&&ch.cur)ch.log.insertBefore(d,ch.cur);else ch.log.appendChild(d);ch.think={d,sm,b,n:0}}const k=ch.think;k.n+=m.text.length;k.b.textContent+=m.text;k.b.scrollTop=k.b.scrollHeight;k.sm.textContent=${j('thinking')}+' ('+k.n+')';ch.log.scrollTop=ch.log.scrollHeight}
+else if(m.type==='status'){if(!ch.st){ch.st=document.createElement('div');ch.st.className='status';ch.log.appendChild(ch.st)}ch.st.textContent=m.text;ch.st.dataset.final=m.final?'1':'';ch.log.scrollTop=ch.log.scrollHeight}
+else if(m.type==='delta'&&ch.cur){endThink(ch);if(ch.waiting){ch.waiting=false;ch.cur.classList.remove('wait');ch.cur.textContent=''}ch.cur.textContent+=m.text;ch.log.scrollTop=ch.log.scrollHeight}
 else if(m.type==='config'){perm=m.values.enableTools?(m.values.permissionMode||'off'):'none';renderPerm();keys.forEach(k=>setv(document.getElementById('c_'+k),m.values[k]));curModel=m.values.model||'';if(![...sel.options].some(o=>o.value===curModel)&&curModel){const o=document.createElement('option');o.value=curModel;o.textContent=curModel;sel.appendChild(o)}if(curModel)sel.value=curModel}
 else if(m.type==='saved'){const s=document.getElementById('savedMsg');s.textContent=${j('saved')};setTimeout(()=>s.textContent='',2000)}
 else if(m.type==='models'){const dl=document.getElementById('models');dl.innerHTML='';m.ids.forEach(i=>{const o=document.createElement('option');o.value=i;dl.appendChild(o)});fillModels(m.ids)}
@@ -1017,8 +1257,8 @@ else if(m.type==='mentionResults'){mentionItems=m.items||[];mentionSel=mentionIt
 else if(m.type==='tool'){addTool(m.text,ch.log)}
 else if(m.type==='info'){add('assistant',m.text,ch.log)}
 else if(m.type==='error'){add('error',m.text,ch.log)}
-else if(m.type==='end'){if(ch.waiting&&ch.cur){ch.cur.remove()}ch.waiting=false;ch.cur=null;ch.busy=false;updateBusy()}
-else if(m.type==='cleared'){ch.log.innerHTML='';ch.waiting=false;ch.cur=null;ch.busy=false;updateBusy()}});
+else if(m.type==='end'){endThink(ch);if(ch.st&&!ch.st.dataset.final)ch.st.remove();ch.st=null;if(ch.waiting&&ch.cur){ch.cur.remove()}ch.waiting=false;ch.cur=null;ch.busy=false;updateBusy()}
+else if(m.type==='cleared'){ch.log.innerHTML='';ch.think=null;ch.st=null;ch.waiting=false;ch.cur=null;ch.busy=false;updateBusy()}});
 </script></body></html>`;
 }
 
