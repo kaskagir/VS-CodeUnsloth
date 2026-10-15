@@ -4,6 +4,9 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = require("vscode");
 const child_process_1 = require("child_process");
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
 function toolMatch(name, patterns) {
     return (patterns ?? []).some(p => new RegExp('^' + String(p).replace(/[.+?^$(){}|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(name));
 }
@@ -189,6 +192,22 @@ class McpManager {
 }
 const mcpManager = new McpManager();
 let serverCtx = 0;
+function ctxFromModels(json, model) {
+    const list = Array.isArray(json?.data) ? json.data : [];
+    const m = list.find(x => x?.id === model) ?? (list.length === 1 ? list[0] : undefined);
+    const n = Number(m?.context_length);
+    return Number.isInteger(n) && n > 0 ? n : 0;
+}
+async function fetchServerCtx(baseUrl, headers, model) {
+    try {
+        const res = await fetch(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+            serverCtx = ctxFromModels(await res.json(), model) || serverCtx;
+        }
+    }
+    catch {
+    }
+}
 function streamError(data) {
     try {
         const j = JSON.parse(data);
@@ -250,8 +269,8 @@ function trimMessages(messages, limit, keepTurns, extraChars, ratio = 1) {
     return [dropped, shortened];
 }
 const FIELDS = {
-    baseUrl: 's', apiKey: 's', model: 's', systemPrompt: 's', reasoningEffort: 's', runFlags: 's', contextLength: 'n',
-    contextTrim: 's', contextBudget: 'n', trimKeepTurns: 'n',
+    baseUrl: 's', apiKey: 's', model: 's', systemPrompt: 's', reasoningEffort: 's', runFlags: 's', hfHome: 's', contextLength: 'n',
+    contextTrim: 's', contextBudget: 'n', trimKeepTurns: 'n', activeFileMode: 's',
     temperature: 'n', maxTokens: 'n', topP: 'n', topK: 'n', minP: 'n', repeatPenalty: 'n', seed: 'n',
     enableTools: 'b', permissionMode: 's', toolPython: 'b', toolWebSearch: 'b', toolTerminal: 'b',
     mcpServers: 'j', mcpConfirm: 'b', mcpExclusive: 'b', mcpHint: 's', mcpHintExclusive: 's', mcpDescMaxLength: 'n'
@@ -263,6 +282,11 @@ const I18N = {
     dirRef: ["Verzeichnis @{0}:", "Directory @{0}:"],
     empty: ["(leer)", "(empty)"],
     activeFile: ["Aktuell geöffnete Datei {0}:", "Currently open file {0}:"],
+    activeFileRef: ["Aktuell geöffnete Datei (nur Referenz, Inhalt bei Bedarf per Tool lesen): {0}\nAbsoluter Pfad: {1}\nCursor in Zeile {2}.", "Currently open file (reference only, read its content with a tool if needed): {0}\nAbsolute path: {1}\nCursor at line {2}."],
+    activeFileSel: ["Markierung (Zeilen {0}-{1}):", "Selection (lines {0}-{1}):"],
+    activeFileMode: ["Geöffnete Datei mitsenden als", "Send open file as"],
+    afmContent: ["Vollständiger Inhalt", "Full content"],
+    afmReference: ["Nur Referenz (Pfad + Markierung)", "Reference only (path + selection)"],
     errPerm: ["Berechtigung konnte nicht gespeichert werden: {0}", "Could not save permission: {0}"],
     errSave: ["Speichern fehlgeschlagen: {0}", "Saving failed: {0}"],
     errModels: ["Modelle laden fehlgeschlagen: {0}", "Loading models failed: {0}"],
@@ -286,6 +310,7 @@ const I18N = {
     openSettingsJson: ["MCP-Server in settings.json eintragen", "Edit MCP servers in settings.json"],
     openSettingsJsonTip: ["Öffnet die settings.json (Einstellung unslothChat.mcpServers)", "Opens settings.json (setting unslothChat.mcpServers)"],
     runFlags: ["Zusätzliche Flags für \"unsloth run\"", "Additional flags for \"unsloth run\""],
+    hfHome: ["Modell-Downloadverzeichnis (HF_HOME, leer = Standard)", "Model download directory (HF_HOME, empty = default)"],
     contextLength: ["Kontextlänge (Tokens, -c)", "Context length (tokens, -c)"],
     contextTrim: ["Kontext automatisch kürzen", "Trim context automatically"],
     ctOff: ["Aus", "Off"],
@@ -557,6 +582,16 @@ class ChatEngine {
             return '';
         }
         const rel = vscode.workspace.asRelativePath(ed.document.uri, false);
+        const mode = vscode.workspace.getConfiguration('unslothChat').get('activeFileMode', 'content');
+        if (mode === 'reference') {
+            const sel = ed.selection;
+            let block = t('activeFileRef', rel, ed.document.uri.fsPath, String(sel.active.line + 1));
+            if (!sel.isEmpty) {
+                const selText = this.truncate(ed.document.getText(sel));
+                block += `\n${t('activeFileSel', String(sel.start.line + 1), String(sel.end.line + 1))}\n\`\`\`${ed.document.languageId}\n${selText}\n\`\`\``;
+            }
+            return block;
+        }
         const content = this.truncate(ed.document.getText());
         return `${t('activeFile', rel)}\n\`\`\`${ed.document.languageId}\n${content}\n\`\`\``;
     }
@@ -642,8 +677,22 @@ class ChatEngine {
         }
         return { baseUrl, headers };
     }
+    localModels() {
+        const hfHome = (vscode.workspace.getConfiguration('unslothChat').get('hfHome', '') || '').trim();
+        const hub = hfHome ? path.join(hfHome, 'hub')
+            : process.env.HF_HUB_CACHE || path.join(process.env.HF_HOME || path.join(os.homedir(), '.cache', 'huggingface'), 'hub');
+        try {
+            return fs.readdirSync(hub, { withFileTypes: true })
+                .filter(d => d.isDirectory() && d.name.startsWith('models--'))
+                .map(d => d.name.slice(8).split('--').join('/'));
+        }
+        catch {
+            return [];
+        }
+    }
     async listModels() {
         const { baseUrl, headers } = this.conn();
+        const local = this.localModels();
         try {
             const res = await fetch(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(10000) });
             if (res.status === 401) {
@@ -654,9 +703,13 @@ class ChatEngine {
             }
             const json = await res.json();
             const ids = (json.data ?? []).map((m) => String(m.id));
-            this.post({ type: 'models', ids });
+            serverCtx = ctxFromModels(json, vscode.workspace.getConfiguration('unslothChat').get('model', '')) || serverCtx;
+            this.post({ type: 'models', ids: [...new Set([...ids, ...local])] });
         }
         catch (e) {
+            if (local.length) {
+                this.post({ type: 'models', ids: local });
+            }
             this.post({ type: 'error', text: t('errModels', e?.message ?? e) });
         }
     }
@@ -674,7 +727,9 @@ class ChatEngine {
         const ctx = cfg.get('contextLength', null);
         const ctxFlag = typeof ctx === 'number' && Number.isInteger(ctx) && ctx > 0 ? ` -c ${ctx}` : '';
         serverCtx = 0;
-        const term = vscode.window.createTerminal('Unsloth');
+        const hfHome = (cfg.get('hfHome', '') || '').trim();
+        const env = hfHome ? { HF_HOME: hfHome, HF_HUB_CACHE: path.join(hfHome, 'hub') } : undefined;
+        const term = vscode.window.createTerminal({ name: 'Unsloth', env });
         term.show();
         term.sendText(`unsloth run --model ${model}${ctxFlag}${flags ? ' ' + flags : ''}`);
         this.post({ type: 'info', text: t('termStarted', model) });
@@ -858,6 +913,9 @@ class ChatEngine {
             const maxTok = cfg.get('maxTokens', 2048);
             const toolChars = mcp.defs.length ? JSON.stringify(mcp.defs).length : 0;
             const reserve = (limit) => Math.min(maxTok, Math.floor(limit / 4));
+            if (trimMode === 'auto' && !serverCtx) {
+                await fetchServerCtx(baseUrl, headers, cfg.get('model', 'unsloth'));
+            }
             const notify = ([d, s]) => {
                 if (d || s) {
                     this.post({ type: 'tool', text: t('trimmed', d, s) });
@@ -869,7 +927,7 @@ class ChatEngine {
                 let res;
                 for (let attempt = 0;; attempt++) {
                     if (trimMode === 'auto') {
-                        const limit = cfg.get('contextBudget', null) || cfg.get('contextLength', null) || serverCtx;
+                        const limit = cfg.get('contextBudget', null) || serverCtx || cfg.get('contextLength', null);
                         if (limit && limit > 0) {
                             notify(trimMessages(messages, limit - reserve(limit), keepTurns, toolChars));
                         }
@@ -903,9 +961,19 @@ class ChatEngine {
                         catch {
                             err = undefined;
                         }
-                        const nCtx = Number(err?.n_ctx);
-                        const nPrompt = Number(err?.n_prompt_tokens);
-                        if (err?.type === 'exceed_context_size_error' && nCtx > 0 && nPrompt > 0) {
+                        let nCtx = Number(err?.n_ctx);
+                        let nPrompt = Number(err?.n_prompt_tokens);
+                        let tooLong = err?.type === 'exceed_context_size_error';
+                        // OpenAI-style: {"code":"context_length_exceeded","message":"... 30335 tokens exceeds the 30208-token context window ..."}
+                        if (!tooLong && (err?.code === 'context_length_exceeded' || /context.?(length|window|size)/i.test(String(err?.message ?? '')))) {
+                            const m = /(\d+)\s*tokens?\s+exceeds?\s+(?:the\s+)?(\d+)/i.exec(String(err?.message ?? ''));
+                            if (m) {
+                                nPrompt = Number(m[1]);
+                                nCtx = Number(m[2]);
+                                tooLong = true;
+                            }
+                        }
+                        if (tooLong && nCtx > 0 && nPrompt > 0) {
                             serverCtx = nCtx;
                             this.post({ type: 'error', text: `HTTP ${res.status} ${res.statusText}: ${errText}` });
                             const ratio = nPrompt / Math.max(1, estTokens(messages, toolChars));
@@ -1131,8 +1199,10 @@ button{background:var(--vscode-button-background);color:var(--vscode-button-fore
 <datalist id="models"></datalist>
 <div style="display:flex;gap:4px;margin-top:4px"><button id="runModel" title="${t('runModelTip')}">${t('runModel')}</button></div>
 <div style="display:flex;gap:4px;margin-top:4px"><button id="openSettingsJson" title="${t('openSettingsJsonTip')}">&#123;&#125; ${t('openSettingsJson')}</button></div>
-<label>${t('contextLength')}</label><input id="c_contextLength" type="number" step="1024" min="0" placeholder="131072">
+<label>${t('contextLength')}</label><input id="c_contextLength" type="number" step="1024" min="0" placeholder="${t('default')}">
 <label>${t('runFlags')}</label><input id="c_runFlags" placeholder="--threads 8">
+<label>${t('hfHome')}</label><input id="c_hfHome" placeholder="D:\\hf">
+<label>${t('activeFileMode')}</label><select id="c_activeFileMode"><option value="content">${t('afmContent')}</option><option value="reference">${t('afmReference')}</option></select>
 <label>${t('contextTrim')}</label><select id="c_contextTrim"><option value="auto">${t('ctAuto')}</option><option value="onError">${t('ctOnError')}</option><option value="off">${t('ctOff')}</option></select>
 <label>${t('contextBudget')}</label><input id="c_contextBudget" type="number" step="1024" min="0" placeholder="${t('default')}">
 <label>${t('trimKeepTurns')}</label><input id="c_trimKeepTurns" type="number" step="1" min="1">
@@ -1179,7 +1249,7 @@ function selectTab(id){activeId=id;log=chats[id].log;for(const k in chats)chats[
 function newTab(){const id='c'+(++seq)+'_'+Date.now().toString(36);const l=document.createElement('div');l.className='lg';document.body.insertBefore(l,document.getElementById('activeFileBar'));chats[id]={log:l,cur:null,busy:false,named:false,title:'Chat '+seq};selectTab(id)}
 function closeTab(id){vs0.postMessage({type:'closeChat',c:id});chats[id].log.remove();delete chats[id];const ks=Object.keys(chats);if(!ks.length)newTab();else if(activeId===id)selectTab(ks[ks.length-1]);else renderTabs()}
 newTab();
-const keys=['baseUrl','apiKey','model','systemPrompt','reasoningEffort','runFlags','contextLength','contextTrim','contextBudget','trimKeepTurns','temperature','maxTokens','topP','topK','minP','repeatPenalty','seed','enableTools','toolPython','toolWebSearch','toolTerminal','permissionMode','mcpServers','mcpConfirm','mcpExclusive','mcpHint','mcpHintExclusive','mcpDescMaxLength'],val=el=>el.type==='checkbox'?el.checked:el.value,setv=(el,v)=>{if(el.type==='checkbox')el.checked=!!v;else el.value=v??''},cfgEl=document.getElementById('cfg');
+const keys=['baseUrl','apiKey','model','systemPrompt','reasoningEffort','runFlags','hfHome','contextLength','contextTrim','contextBudget','trimKeepTurns','activeFileMode','temperature','maxTokens','topP','topK','minP','repeatPenalty','seed','enableTools','toolPython','toolWebSearch','toolTerminal','permissionMode','mcpServers','mcpConfirm','mcpExclusive','mcpHint','mcpHintExclusive','mcpDescMaxLength'],val=el=>el.type==='checkbox'?el.checked:el.value,setv=(el,v)=>{if(el.type==='checkbox')el.checked=!!v;else el.value=v??''},cfgEl=document.getElementById('cfg');
 document.getElementById('gear').onclick=()=>{cfgEl.style.display=cfgEl.style.display==='block'?'none':'block'};
 document.getElementById('save').onclick=()=>{const v={};keys.forEach(k=>v[k]=val(document.getElementById('c_'+k)));vs.postMessage({type:'saveConfig',values:v})};
 vs.postMessage({type:'getConfig'});
@@ -1203,8 +1273,11 @@ function fillModels(ids){sel.innerHTML='';const list=ids.slice();if(curModel&&!l
 document.getElementById('refresh').onclick=()=>vs.postMessage({type:'listModels'});
 sel.onchange=()=>{curModel=sel.value;document.getElementById('c_model').value=curModel;vs.postMessage({type:'setModel',model:curModel})};
 document.getElementById('loadModels').onclick=()=>vs.postMessage({type:'listModels'});
+const cm=document.getElementById('c_model');
+cm.addEventListener('focus',()=>{cm.dataset.prev=cm.value;cm.placeholder=cm.value;cm.value=''});
+cm.addEventListener('blur',()=>{if(!cm.value)cm.value=cm.dataset.prev||'';cm.placeholder=''});
 document.getElementById('openSettingsJson').onclick=()=>vs.postMessage({type:'openSettingsJson'});
-document.getElementById('runModel').onclick=()=>vs.postMessage({type:'runModel',model:document.getElementById('c_model').value});
+document.getElementById('runModel').onclick=()=>{let v=cm.value.trim().replace(/^https?:\/\/huggingface\.co\//,'').replace(/\/+$/,'');cm.value=v;if(v){curModel=v;if(![...sel.options].some(o=>o.value===v)){const o=document.createElement('option');o.value=v;o.textContent=v;sel.appendChild(o)}sel.value=v;vs.postMessage({type:'setModel',model:v})}vs.postMessage({type:'runModel',model:v})};
 function add(cls,t,l){l=l||log;const d=document.createElement('div');d.className='msg '+cls;d.textContent=t;l.appendChild(d);l.scrollTop=l.scrollHeight;return d}
 function endThink(ch){const k=ch.think;if(!k)return;ch.think=null;k.d.classList.remove('live');k.d.open=false;k.sm.textContent=${j('thought')}+' ('+k.n+')'}
 function dropStatus(ch){if(ch.st){ch.st.remove();ch.st=null}}

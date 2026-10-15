@@ -2,7 +2,7 @@
   "name": "unsloth-chat",
   "displayName": "Unsloth Chat",
   "description": "%description%",
-  "version": "0.1.26",
+  "version": "0.1.37",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
@@ -171,6 +171,15 @@
           "default": null,
           "description": "%contributes.configuration.properties.unslothChat.contextLength.description%"
         },
+        "unslothChat.activeFileMode": {
+          "type": "string",
+          "default": "content",
+          "enum": [
+            "content",
+            "reference"
+          ],
+          "description": "%contributes.configuration.properties.unslothChat.activeFileMode.description%"
+        },
         "unslothChat.contextTrim": {
           "type": "string",
           "default": "auto",
@@ -199,6 +208,11 @@
           "type": "string",
           "default": "",
           "description": "%contributes.configuration.properties.unslothChat.runFlags.description%"
+        },
+        "unslothChat.hfHome": {
+          "type": "string",
+          "default": "",
+          "description": "%contributes.configuration.properties.unslothChat.hfHome.description%"
         },
         "unslothChat.permissionMode": {
           "type": "string",

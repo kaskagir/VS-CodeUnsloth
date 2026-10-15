@@ -80,7 +80,7 @@ code --install-extension unsloth-chat-<version>.vsix
 
 All settings live under `unslothChat.*` in the VS Code settings (or in the gear panel of the chat):
 
-`baseUrl`, `apiKey`, `model`, `systemPrompt`, `temperature`, `maxTokens`, `topP`, `topK`, `minP`, `repeatPenalty`, `seed`, `reasoningEffort`, `enableTools`, `toolPython`, `toolWebSearch`, `toolTerminal`, `permissionMode`, `contextLength`, `contextTrim`, `contextBudget`, `trimKeepTurns`, `runFlags`, `mcpServers`, `mcpConfirm`, `mcpExclusive`, `mcpDescMaxLength`.
+`baseUrl`, `apiKey`, `model`, `systemPrompt`, `temperature`, `maxTokens`, `topP`, `topK`, `minP`, `repeatPenalty`, `seed`, `reasoningEffort`, `enableTools`, `toolPython`, `toolWebSearch`, `toolTerminal`, `permissionMode`, `contextLength`, `contextTrim`, `contextBudget`, `trimKeepTurns`, `runFlags`, `hfHome`, `mcpServers`, `mcpConfirm`, `mcpExclusive`, `mcpDescMaxLength`.
 
 ## MCP tools
 
